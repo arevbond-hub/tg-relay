@@ -1,143 +1,144 @@
-import { connect } from "cloudflare:sockets";
-import { DurableObject } from "cloudflare:workers";
+import chunkRelayWorker, { ChunkRelayHub } from "./chunk-relay-worker.js";
 
-const CORS = {
-"Access-Control-Allow-Origin": "*",
-"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-"Access-Control-Allow-Headers": "*",
-};
+const REVISION = "chunk-relay-mtproto-v10";
+const HUB_REVISION = "relay-hub-v1";
+const RELAY_ERROR_HEADER = "X-Tgws-Relay-Error";
 
-function json(data, status = 200) {
-return new Response(JSON.stringify(data), {
-status,
-headers: { "Content-Type": "application/json", ...CORS },
-});
-}
-
-export class ChunkRelaySession extends DurableObject {
-constructor(ctx, env) {
-super(ctx, env);
-this.socket = null;
-this.writer = null;
-this.reader = null;
-this.buffer = [];
-this.closed = false;
+function errorHeaders(relayError, source = null) {
+  const headers = new Headers(source?.headers || undefined);
+  headers.set("Cache-Control", "no-store");
+  headers.set("X-Tgws-Chunk-Relay-Revision", REVISION);
+  headers.set("X-Tgws-Relay-Hub-Revision", HUB_REVISION);
+  headers.set(RELAY_ERROR_HEADER, relayError);
+  return headers;
 }
 
-async ensureSocket(host, port) {
-if (this.socket) return;
-this.socket = connect({ hostname: host, port: Number(port) || 443 });
-this.writer = this.socket.writable.getWriter();
-this.reader = this.socket.readable.getReader();
-this.readLoop();
+function relayResponse(response, relayError, status = response.status) {
+  return new Response(response.body, {
+    status,
+    statusText: response.statusText,
+    headers: errorHeaders(relayError, response),
+  });
 }
 
-async readLoop() {
-try {
-while (!this.closed) {
-const { value, done } = await this.reader.read();
-if (done) break;
-if (value?.length) this.buffer.push(value);
-}
-} catch {
-} finally {
-this.closed = true;
-}
+function relayFailure(relayError, status, text = "relay failed") {
+  return new Response(text, { status, headers: errorHeaders(relayError) });
 }
 
-async fetch(request) {
-const url = new URL(request.url);
-const action = url.pathname.split("/").pop();
-
-if (action === "open") {
-let host = url.searchParams.get("host") || url.searchParams.get("dst") || request.headers.get("X-Relay-Target");
-let port = url.searchParams.get("port") || "443";
-if (request.method === "POST") {
-try {
-const body = await request.clone().json();
-host = body.host || body.dst || body.target || host;
-port = body.port || port;
-} catch {}
-}
-if (host && host.includes(":")) [host, port] = host.split(":");
-if (!host) return json({ error: "Missing target host" }, 400);
-try {
-await this.ensureSocket(host, port);
-return json({ ok: true, status: "open" }, 200);
-} catch (e) {
-this.closed = true;
-return json({ error: String(e) }, 502);
-}
+function requestAction(request) {
+  return new URL(request.url).pathname.split("/").filter(Boolean).at(-1) || "";
 }
 
-if (action === "push" || request.method === "POST") {
-const data = await request.arrayBuffer();
-if (!this.socket || this.closed) return json({ error: "Not open" }, 410);
-try {
-if (data.byteLength > 0) await this.writer.write(new Uint8Array(data));
-return new Response(null, { status: 204, headers: CORS });
-} catch (e) {
-this.closed = true;
-return json({ error: String(e) }, 502);
-}
+function terminalReason(reason, error) {
+  if (reason === "upstream_close") return "upstream_closed";
+  if (reason === "orphan_timeout" || reason === "client_close") return "session_lost";
+  const message = String(error?.message || error || "");
+  if (message.includes("target_mismatch")) return "target_mismatch";
+  return "";
 }
 
-if (action === "poll" || (request.method === "GET" && action !== "close")) {
-const chunks = this.buffer.splice(0, this.buffer.length);
-if (chunks.length === 0) {
-return new Response(null, { status: this.closed ? 410 : 204, headers: CORS });
-}
-const total = chunks.reduce((s, c) => s + c.length, 0);
-const out = new Uint8Array(total);
-let off = 0;
-for (const c of chunks) { out.set(c, off); off += c.length; }
-return new Response(out, {
-status: 200,
-headers: { "Content-Type": "application/octet-stream", ...CORS },
-});
+function patchRelaySession(session) {
+  if (session.__statusAwarePatched) return session;
+  session.__statusAwarePatched = true;
+  session.__relayError = "";
+
+  const originalTerminate = session.terminate.bind(session);
+  session.terminate = (reason, error) => {
+    const classified = terminalReason(reason, error);
+    if (classified && !session.__relayError) session.__relayError = classified;
+    return originalTerminate(reason, error);
+  };
+
+  const originalDrainUploads = session.drainUploads.bind(session);
+  session.drainUploads = async () => {
+    try {
+      return await originalDrainUploads();
+    } catch (error) {
+      session.__relayError = "socket_write_failed";
+      throw error;
+    }
+  };
+
+  const originalPump = session.pump.bind(session);
+  session.pump = async () => {
+    try {
+      return await originalPump();
+    } catch (error) {
+      session.__relayError = "socket_read_failed";
+      throw error;
+    }
+  };
+
+  const originalFetch = session.fetch.bind(session);
+  session.fetch = async (request) => {
+    const url = new URL(request.url);
+    const action = requestAction(request);
+    const target = (url.searchParams.get("dst") || "").trim();
+
+    if (session.target && target && session.target !== target) {
+      return relayFailure("target_mismatch", 409, "relay failed");
+    }
+
+    const response = await originalFetch(request);
+    if (response.headers.get(RELAY_ERROR_HEADER)) return response;
+
+    if (response.status === 410) {
+      return relayResponse(response, session.__relayError || "session_lost");
+    }
+    if (response.status === 409) {
+      return relayResponse(response, "sequence_conflict");
+    }
+    if (response.status === 413) {
+      return relayResponse(response, "invalid_size");
+    }
+    if (response.status === 405) {
+      return relayResponse(response, "method_not_allowed");
+    }
+    if (response.status === 400) {
+      if (action === "up") return relayResponse(response, "invalid_sequence");
+      if (action === "down") return relayResponse(response, "invalid_ack");
+      return relayResponse(response, "invalid_request");
+    }
+    if (response.status === 502 && session.__relayError) {
+      const code = session.__relayError;
+      const terminal = code === "socket_write_failed" || code === "socket_read_failed" || code === "upstream_closed" || code === "session_lost";
+      return relayResponse(response, code, terminal ? 410 : 502);
+    }
+    if (response.status >= 500) {
+      return relayResponse(response, "transient_worker_error");
+    }
+    return response;
+  };
+
+  return session;
 }
 
-if (action === "close") {
-this.closed = true;
-try { await this.writer?.close(); } catch {}
-try { await this.socket?.close(); } catch {}
-return new Response(null, { status: 204, headers: CORS });
+export class ChunkRelaySession extends ChunkRelayHub {
+  getOrCreateSession(sid) {
+    return patchRelaySession(super.getOrCreateSession(sid));
+  }
 }
 
-return json({ error: "Unknown action" }, 404);
-}
-}
+export { ChunkRelaySession as ChunkRelayHub };
 
 export default {
-async fetch(request, env) {
-if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-const url = new URL(request.url);
-
-if (url.pathname === "/" || url.pathname === "/health") {
-return json({
-status: "ok",
-protocol: "chunk-relay-mtproto",
-hasBinding: Boolean(env.CHUNK_RELAY),
-});
-}
-
-let sid = url.searchParams.get("session") || url.searchParams.get("sid") || url.searchParams.get("id") || request.headers.get("X-Relay-Session");
-if (!sid && request.method === "POST" && url.pathname.endsWith("/open")) {
-try {
-const b = await request.clone().json();
-sid = b.session || b.sid || b.id;
-} catch {}
-}
-
-if (!sid) sid = crypto.randomUUID();
-if (!env.CHUNK_RELAY) return json({ error: "CHUNK_RELAY binding missing" }, 500);
-
-const stub = env.CHUNK_RELAY.get(env.CHUNK_RELAY.idFromName(sid));
-const res = await stub.fetch(request);
-if (url.pathname.endsWith("/open") && res.ok) {
-const data = await res.json();
-return json({ ...data, session: sid, sid, id: sid }, 200);
-}
-return res;
-},
+  async fetch(request, env, ctx) {
+    try {
+      const response = await chunkRelayWorker.fetch(request, env, ctx);
+      if (!new URL(request.url).pathname.startsWith("/chunk-relay/")) return response;
+      if (response.headers.get(RELAY_ERROR_HEADER)) return response;
+      if (response.status === 410) return relayResponse(response, "session_lost");
+      if (response.status === 409) return relayResponse(response, "sequence_conflict");
+      if (response.status >= 500 && response.status !== 503) return relayResponse(response, "transient_worker_error");
+      return response;
+    } catch (error) {
+      console.log("chunk relay status wrapper caught worker failure", {
+        revision: REVISION,
+        hub_revision: HUB_REVISION,
+        relay_error: "transient_worker_error",
+        error: String(error),
+      });
+      return relayFailure("transient_worker_error", 502);
+    }
+  },
 };
