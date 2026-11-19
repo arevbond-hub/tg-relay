@@ -4,8 +4,8 @@ compatibility_date = "2024-11-01"
 
 [[durable_objects.bindings]]
 name = "CHUNK_RELAY"
-class_name = "ChunkRelaySession"
+class_name = "ChunkRelayHub"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ChunkRelaySession"]
+new_sqlite_classes = ["ChunkRelayHub"]
