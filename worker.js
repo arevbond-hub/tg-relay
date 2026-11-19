@@ -1,16 +1,16 @@
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const CORS_HEADERS = {
+const CORS = {
 "Access-Control-Allow-Origin": "*",
 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-"Access-Control-Allow-Headers": "Content-Type, X-Relay-Target, X-Relay-Session, X-Relay-Seq",
+"Access-Control-Allow-Headers": "*",
 };
 
-function jsonResponse(data, status = 200) {
+function json(data, status = 200) {
 return new Response(JSON.stringify(data), {
 status,
-headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+headers: { "Content-Type": "application/json", ...CORS },
 });
 }
 
@@ -22,14 +22,11 @@ this.writer = null;
 this.reader = null;
 this.buffer = [];
 this.closed = false;
-this.lastActivity = Date.now();
 }
 
-async ensureSocket(target) {
+async ensureSocket(host, port) {
 if (this.socket) return;
-const [hostname, portStr] = target.split(":");
-const port = parseInt(portStr || "443", 10);
-this.socket = connect({ hostname, port });
+this.socket = connect({ hostname: host, port: Number(port) || 443 });
 this.writer = this.socket.writable.getWriter();
 this.reader = this.socket.readable.getReader();
 this.readLoop();
@@ -40,9 +37,7 @@ try {
 while (!this.closed) {
 const { value, done } = await this.reader.read();
 if (done) break;
-if (value && value.length > 0) {
-this.buffer.push(value);
-}
+if (value?.length) this.buffer.push(value);
 }
 } catch {
 } finally {
@@ -51,85 +46,98 @@ this.closed = true;
 }
 
 async fetch(request) {
-this.lastActivity = Date.now();
 const url = new URL(request.url);
-const target = request.headers.get("X-Relay-Target");
+const action = url.pathname.split("/").pop();
 
+if (action === "open") {
+let host = url.searchParams.get("host") || url.searchParams.get("dst") || request.headers.get("X-Relay-Target");
+let port = url.searchParams.get("port") || "443";
 if (request.method === "POST") {
-if (!target) return jsonResponse({ error: "Missing target" }, 400);
 try {
-await this.ensureSocket(target);
-const body = await request.arrayBuffer();
-if (body.byteLength > 0) {
-await this.writer.write(new Uint8Array(body));
+const body = await request.clone().json();
+host = body.host || body.dst || body.target || host;
+port = body.port || port;
+} catch {}
 }
-return new Response(null, { status: 204, headers: CORS_HEADERS });
+if (host && host.includes(":")) [host, port] = host.split(":");
+if (!host) return json({ error: "Missing target host" }, 400);
+try {
+await this.ensureSocket(host, port);
+return json({ ok: true, status: "open" }, 200);
 } catch (e) {
 this.closed = true;
-return jsonResponse({ error: String(e) }, 502);
+return json({ error: String(e) }, 502);
 }
 }
 
-if (request.method === "GET") {
-if (url.pathname.endsWith("/close")) {
+if (action === "push" || request.method === "POST") {
+const data = await request.arrayBuffer();
+if (!this.socket || this.closed) return json({ error: "Not open" }, 410);
+try {
+if (data.byteLength > 0) await this.writer.write(new Uint8Array(data));
+return new Response(null, { status: 204, headers: CORS });
+} catch (e) {
+this.closed = true;
+return json({ error: String(e) }, 502);
+}
+}
+
+if (action === "poll" || (request.method === "GET" && action !== "close")) {
+const chunks = this.buffer.splice(0, this.buffer.length);
+if (chunks.length === 0) {
+return new Response(null, { status: this.closed ? 410 : 204, headers: CORS });
+}
+const total = chunks.reduce((s, c) => s + c.length, 0);
+const out = new Uint8Array(total);
+let off = 0;
+for (const c of chunks) { out.set(c, off); off += c.length; }
+return new Response(out, {
+status: 200,
+headers: { "Content-Type": "application/octet-stream", ...CORS },
+});
+}
+
+if (action === "close") {
 this.closed = true;
 try { await this.writer?.close(); } catch {}
 try { await this.socket?.close(); } catch {}
-return new Response(null, { status: 204, headers: CORS_HEADERS });
+return new Response(null, { status: 204, headers: CORS });
 }
 
-const chunks = this.buffer.splice(0, this.buffer.length);
-if (chunks.length === 0) {
-return new Response(null, {
-status: this.closed ? 410 : 204,
-headers: CORS_HEADERS,
-});
-}
-
-const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-const merged = new Uint8Array(totalLen);
-let offset = 0;
-for (const c of chunks) {
-merged.set(c, offset);
-offset += c.length;
-}
-
-return new Response(merged, {
-status: 200,
-headers: { "Content-Type": "application/octet-stream", ...CORS_HEADERS },
-});
-}
-
-return new Response("Method not allowed", { status: 405, headers: CORS_HEADERS });
+return json({ error: "Unknown action" }, 404);
 }
 }
 
 export default {
 async fetch(request, env) {
-if (request.method === "OPTIONS") {
-return new Response(null, { status: 204, headers: CORS_HEADERS });
-}
-
+if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 const url = new URL(request.url);
-if (url.pathname === "/health" || url.pathname === "/") {
-return jsonResponse({
+
+if (url.pathname === "/" || url.pathname === "/health") {
+return json({
 status: "ok",
 protocol: "chunk-relay-mtproto",
 hasBinding: Boolean(env.CHUNK_RELAY),
 });
 }
 
-const sessionId = request.headers.get("X-Relay-Session");
-if (!sessionId) {
-return jsonResponse({ error: "Missing X-Relay-Session" }, 400);
+let sid = url.searchParams.get("session") || url.searchParams.get("sid") || url.searchParams.get("id") || request.headers.get("X-Relay-Session");
+if (!sid && request.method === "POST" && url.pathname.endsWith("/open")) {
+try {
+const b = await request.clone().json();
+sid = b.session || b.sid || b.id;
+} catch {}
 }
 
-if (!env.CHUNK_RELAY) {
-return jsonResponse({ error: "CHUNK_RELAY binding missing" }, 500);
-}
+if (!sid) sid = crypto.randomUUID();
+if (!env.CHUNK_RELAY) return json({ error: "CHUNK_RELAY binding missing" }, 500);
 
-const id = env.CHUNK_RELAY.idFromName(sessionId);
-const stub = env.CHUNK_RELAY.get(id);
-return stub.fetch(request);
+const stub = env.CHUNK_RELAY.get(env.CHUNK_RELAY.idFromName(sid));
+const res = await stub.fetch(request);
+if (url.pathname.endsWith("/open") && res.ok) {
+const data = await res.json();
+return json({ ...data, session: sid, sid, id: sid }, 200);
+}
+return res;
 },
 };
